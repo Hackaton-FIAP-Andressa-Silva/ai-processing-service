@@ -1,0 +1,153 @@
+# Development environment for ai-processing-service
+#
+# Includes all dependent services so the full processing pipeline can be tested:
+#   LocalStack (S3 + SQS) · PostgreSQL · MongoDB
+#   upload-service · report-service · ai-processing-service (worker)
+#
+# REQUIRED: set GOOGLE_API_KEY before starting (https://aistudio.google.com)
+#
+# Usage:
+#   cp .env.example .env          # then fill GOOGLE_API_KEY
+#   docker compose up --build     # start the full stack
+#   docker compose down -v        # stop and remove volumes
+#
+# To watch worker logs only:
+#   docker compose logs -f ai-processing-service
+
+networks:
+  default:
+    name: ai-processing-dev
+
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: upload_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mongodb:
+    image: mongo:7.0
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  localstack:
+    image: localstack/localstack:3.4
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,sqs
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ./scripts/init-localstack.sh:/etc/localstack/init/ready.d/init-localstack.sh
+      - localstack_data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  # One-shot migration runner for upload-service's PostgreSQL schema
+  migrate:
+    build:
+      context: ../upload-service
+      dockerfile: Dockerfile
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/upload_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── Application Services ────────────────────────────────────────────────────
+
+  upload-service:
+    build:
+      context: ../upload-service
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      APP_NAME: upload-service
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/upload_db
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://localstack:4566
+      S3_BUCKET_NAME: architecture-diagrams
+      SQS_QUEUE_URL: http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/diagram-analysis-queue
+      INTERNAL_SERVICE_TOKEN: dev-internal-token
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  report-service:
+    build:
+      context: ../report-service
+      dockerfile: Dockerfile
+    ports:
+      - "8003:8003"
+    environment:
+      APP_NAME: report-service
+      MONGODB_URL: mongodb://mongodb:27017
+      MONGODB_DATABASE: report_db
+      INTERNAL_SERVICE_TOKEN: dev-internal-token
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ai-processing-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      APP_NAME: ai-processing-service
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://localstack:4566
+      S3_BUCKET_NAME: architecture-diagrams
+      SQS_QUEUE_URL: http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/diagram-analysis-queue
+      UPLOAD_SERVICE_URL: http://upload-service:8001
+      REPORT_SERVICE_URL: http://report-service:8003
+      INTERNAL_SERVICE_TOKEN: dev-internal-token
+    depends_on:
+      localstack:
+        condition: service_healthy
+      upload-service:
+        condition: service_healthy
+      report-service:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  mongo_data:
+  localstack_data:
