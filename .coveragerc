@@ -1,0 +1,14 @@
+[run]
+source = src
+omit =
+    src/worker.py
+    src/infrastructure/config.py
+    src/infrastructure/ai/openai_analyzer.py
+    src/infrastructure/pdf/*
+    src/infrastructure/storage/*
+    src/infrastructure/messaging/*
+    src/infrastructure/http/*
+    src/infrastructure/logging_config.py
+
+[report]
+fail_under = 80
